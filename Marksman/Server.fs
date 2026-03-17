@@ -959,6 +959,12 @@ type MarksmanServer(client: MarksmanClient) =
                     if config.CaLinkToReferenceEnable() then
                         CodeActions.linkToReference opts.Range opts.Context doc
                         |> Option.toArray
+                        |> Array.map (fun ca ->
+                            let wsEdit =
+                                CodeActions.multiDocumentEdit ca.edits opts.TextDocument.Uri
+
+                            let caKind = Some CodeActionKind.RefactorRewrite
+                            codeAction ca.name caKind wsEdit)
                     else
                         [||]
 

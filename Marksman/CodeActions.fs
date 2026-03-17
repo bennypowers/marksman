@@ -37,6 +37,16 @@ let createFile newFileUri : WorkspaceEdit =
 
     { Changes = None; DocumentChanges = Some documentChanges }
 
+type MultiEditAction = { name: string; edits: list<Range * string> }
+
+let multiDocumentEdit (edits: list<Range * string>) (documentUri: DocumentUri) : WorkspaceEdit =
+    let textEdits =
+        edits
+        |> List.map (fun (range, text) -> { NewText = text; Range = range })
+        |> Array.ofList
+
+    { Changes = Some(Map.ofList [ documentUri, textEdits ]); DocumentChanges = None }
+
 let tableOfContentsInner (includeLevels: array<int>) (doc: Doc) : DocumentAction option =
     match TableOfContents.mk includeLevels (Doc.index doc) with
     | Some toc ->
@@ -162,100 +172,49 @@ let createMissingFile
         { name = $"Create `{filename}`"; newFileUri = uri }
     }
 
-let linkToReference (range: Range) (context: CodeActionContext) (doc: Doc) : CodeAction option =
-    let getExistingRefAction (link: Node<MdLink>, linkDef: Node<MdLinkDef>) : CodeAction option =
+let linkToReference (range: Range) (_context: CodeActionContext) (doc: Doc) : MultiEditAction option =
+    let mkLabel (text: string) =
+        text
+        |> String.toLower
+        |> String.replace " " "-"
+        |> String.replace "_" "-"
+        |> String.replace "." "-"
+
+    let hasUrl (url: UrlEncodedNode) (def: Node<MdLinkDef>) = url.text.Equals(def.data.url.text)
+
+    let getAction (link: Node<MdLink>) : MultiEditAction option =
         match link.data with
-        | MdLink.IL(text, _, _) ->
-            Some {
-                Title = $"Replace link with reference `{linkDef.data.label.text}`"
-                Kind = Some CodeActionKind.RefactorRewrite
-                Command = None
-                Data = None
-                Diagnostics = None
-                Disabled = None
-                IsPreferred = None
-                Edit =
-                    Some {
-                        DocumentChanges = None
-                        Changes =
-                            Some
-                                Map[Doc.uri doc,
-                                    [|
-                                        {
-                                            Range = Node.range link
-                                            NewText = $"[{text.text}][{linkDef.data.label.text}]"
-                                        }
-                                    |]]
-                    }
-            }
+        | MdLink.IL(text, Some url, title) ->
+            let existingDef = (Doc.index doc).linkDefs |> Seq.tryFind (hasUrl url)
+
+            match existingDef with
+            | Some def ->
+                Some {
+                    name = $"Replace link with reference `{def.data.label.text}`"
+                    edits = [ Node.range link, $"[{text.text}][{def.data.label.text}]" ]
+                }
+            | None ->
+                let label = mkLabel text.text
+
+                let titleSuffix =
+                    match title with
+                    | Some t -> $" \"{t.text}\""
+                    | None -> ""
+
+                let refDefText = $"[{label}]: {url.text}{titleSuffix}"
+
+                let numLines = (Doc.text doc).lineMap.NumLines
+                let refRange = Range.Mk(numLines, 0, numLines, 0)
+
+                Some {
+                    name = $"Convert link to new reference `{label}`"
+                    edits = [
+                        Node.range link, $"[{text.text}][{label}]"
+                        refRange, $"{NewLine}{refDefText}"
+                    ]
+                }
         | _ -> None
 
-    let getNonExistingRefAction (link: Node<MdLink>) : CodeAction option =
-        match link.data with
-        | MdLink.IL(text, url, title) ->
-            let label =
-                text.text
-                |> String.toLower
-                |> String.replace " " "-"
-                |> String.replace "_" "-"
-                |> String.replace "." "-"
-
-            let refText = $"[{label}]: {url.Value.text}"
-
-            (* a new line at the end of the doc's text *)
-            let refRange =
-                let text = Doc.text doc
-                let line = text.lineMap.NumLines + 1
-                Range.Mk(line, 0, line + 1, refText.Length)
-
-            Some {
-                Data = None
-                Disabled = None
-                IsPreferred = None
-                Command = None
-                Title = $"Convert link to new reference `{label}`"
-                Kind = Some CodeActionKind.RefactorRewrite
-                Diagnostics = None
-                Edit =
-                    Some {
-                        DocumentChanges = None
-                        Changes =
-                            Some
-                                Map[Doc.uri doc,
-                                    [|
-                                        {
-                                            Range = Node.range link
-                                            NewText = $"[{text.text}][{label}]"
-                                        }
-                                        { Range = refRange; NewText = refText }
-                                    |]]
-                    }
-            }
-        | _ -> None
-
-    let hasUrl (url: UrlEncodedNode) (x: Node<MdLinkDef>) = url.text.Equals(x.data.url.text)
-
-    let getAction (link: Node<MdLink>) : CodeAction option =
-        match link.data with
-        | MdLink.IL(_, Some(url), _) ->
-            let linkDef = doc.Index.linkDefs |> Seq.tryFind (hasUrl url)
-
-            match linkDef with
-            | Some(def) -> getExistingRefAction (link, def)
-            | None -> getNonExistingRefAction link
-        | _ -> None
-
-    let isInRange (range: Range) (node: Node<MdLink>) =
-        range.Start.Line >= node.range.Start.Line
-        && range.End.Line <= node.range.End.Line
-
-    let isInlineLink (node: Node<MdLink>) =
-        match node.data with
-        | MdLink.IL(_, _, _) -> true
-        | _ -> false
-
-    (* get the markdown link at the given range *)
-    doc.Index.mdLinks
-    |> Seq.filter (isInRange range)
-    |> Seq.tryFind isInlineLink
+    (Doc.index doc).mdLinks
+    |> Seq.tryFind (fun node -> node.range.ContainsInclusive(range.Start))
     |> Option.bind getAction
